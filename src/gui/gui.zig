@@ -65,6 +65,7 @@ pub const Gui = struct {
 
     pub fn create(allocator: std.mem.Allocator, bridge: Bridge) !*Gui {
         const self = try allocator.create(Gui);
+        errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator, .bridge = bridge };
 
         // Set up Clay with its own arena and a text-measurement callback.
