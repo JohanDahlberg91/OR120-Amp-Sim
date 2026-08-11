@@ -1,16 +1,21 @@
-//! Procedural OpenGL decoration drawn around the Clay-declared panel:
+//! OpenGL decoration drawn around the Clay-declared panel:
 //!   * a woven-vinyl tolex background with a soft vignette and corner screws,
 //!     rendered behind the Clay pass (the panel root is transparent);
-//!   * spherically shaded knobs (lit body, raised cap, silkscreen tick ring and
-//!     cream pointer), rendered as an overlay on top of the Clay pass using the
-//!     knob bounding boxes cached from the layout.
+//!   * knobs with a silkscreen tick ring, rendered as an overlay on top of the
+//!     Clay pass using the knob bounding boxes cached from the layout.
 //!
-//! Everything is immediate-mode GL with smooth vertex colours, so no external
-//! image assets are required.
+//! The tolex and the knob bodies come from baked textures (`assets/`, built by
+//! `tools/bake_assets`), which buys per-pixel lighting and supersampled edges
+//! that fixed-function GL cannot produce live. The tick ring stays procedural
+//! because its tick count varies per parameter.
+//!
+//! Every textured path keeps its original immediate-mode drawing as a fallback,
+//! used when a texture failed to load, so the GUI degrades instead of vanishing.
 
 const std = @import("std");
 const gl = @import("gl.zig");
 const theme = @import("theme.zig");
+const texture = @import("texture.zig");
 
 const tau = std.math.tau;
 
@@ -40,9 +45,15 @@ fn setOrtho(w: f32, h: f32) void {
 // Background
 // ---------------------------------------------------------------------------
 
-/// Fill the framebuffer with the tolex colour, overlay a woven cross-hatch, a
-/// soft edge vignette and four corner screws.
-pub fn drawTolexBackground(width: i32, height: i32) void {
+/// Screen pixels per texel when tiling the tolex swatch. Kept at 1.0 so the
+/// swatch is never minified — there are no mipmaps, and the weave is baked at
+/// the pitch it should appear at on screen.
+const tolex_tile_scale: f32 = 1.0;
+
+/// Fill the framebuffer with tiled tolex, a soft edge vignette and four corner
+/// screws. Falls back to the original flat fill plus cross-hatch if the texture
+/// is unavailable.
+pub fn drawTolexBackground(tex: *const texture.Set, width: i32, height: i32) void {
     const w: f32 = @floatFromInt(width);
     const h: f32 = @floatFromInt(height);
     setOrtho(w, h);
@@ -51,7 +62,25 @@ pub fn drawTolexBackground(width: i32, height: i32) void {
     gl.glEnable(gl.GL_LINE_SMOOTH);
     gl.glHint(gl.GL_LINE_SMOOTH_HINT, gl.GL_NICEST);
 
-    // Base tolex fill.
+    if (tex.tolex.valid()) {
+        texture.drawTiled(tex.tolex, 0, 0, w, h, tolex_tile_scale);
+    } else {
+        drawTolexFallback(w, h);
+    }
+
+    drawVignette(w, h);
+
+    // Corner screws, inset into the picture-frame border.
+    const inset: f32 = 15.0;
+    drawScrew(inset, inset);
+    drawScrew(w - inset, inset);
+    drawScrew(inset, h - inset);
+    drawScrew(w - inset, h - inset);
+}
+
+/// Flat tolex fill with an interleaved cross-hatch weave. Used only when the
+/// baked swatch is missing; the texture path supersedes it.
+fn drawTolexFallback(w: f32, h: f32) void {
     color(theme.tolex.r, theme.tolex.g, theme.tolex.b, 255);
     gl.glBegin(gl.GL_QUADS);
     gl.glVertex2f(0, 0);
@@ -60,7 +89,6 @@ pub fn drawTolexBackground(width: i32, height: i32) void {
     gl.glVertex2f(0, h);
     gl.glEnd();
 
-    // Woven cross-hatch: interleaved dark and light diagonals.
     const spacing: f32 = 7.0;
     gl.glLineWidth(1.0);
     color(150, 60, 12, 26);
@@ -79,15 +107,6 @@ pub fn drawTolexBackground(width: i32, height: i32) void {
         gl.glVertex2f(d, h);
     }
     gl.glEnd();
-
-    drawVignette(w, h);
-
-    // Corner screws, inset into the picture-frame border.
-    const inset: f32 = 15.0;
-    drawScrew(inset, inset);
-    drawScrew(w - inset, inset);
-    drawScrew(inset, h - inset);
-    drawScrew(w - inset, h - inset);
 }
 
 /// Darken the framebuffer edges with a centre-transparent fan for depth.
@@ -175,9 +194,41 @@ fn ring(cx: f32, cy: f32, r: f32, width: f32, cr: f32, cg: f32, cb: f32, ca: f32
 }
 
 /// Draw one knob centred at (cx, cy) with body radius `r`. `value` is the
-/// normalised 0..1 parameter value (drives the pointer) and `ticks` is the
-/// number of position marks around the sweep.
-pub fn drawKnob(cx: f32, cy: f32, r: f32, value: f32, ticks: usize) void {
+/// normalised 0..1 parameter value (selects the filmstrip frame, which carries
+/// the pointer) and `ticks` is the number of position marks around the sweep.
+pub fn drawKnob(tex: *const texture.Set, cx: f32, cy: f32, r: f32, value: f32, ticks: usize) void {
+    if (tex.knob.valid()) {
+        // Body, cap, pointer, contact shadow and all shading are baked in.
+        texture.drawKnobFrame(tex.knob, cx, cy, r, value);
+    } else {
+        drawKnobFallback(cx, cy, r, value);
+    }
+    drawTickRing(cx, cy, r, ticks);
+}
+
+/// Silkscreen tick marks around the knob sweep. Kept procedural: the count
+/// varies per parameter, so baking it would need a strip per tick count.
+fn drawTickRing(cx: f32, cy: f32, r: f32, ticks: usize) void {
+    if (ticks < 2) return;
+    gl.glLineWidth(1.5);
+    color(theme.label.r, theme.label.g, theme.label.b, 235);
+    gl.glBegin(gl.GL_LINES);
+    var i: usize = 0;
+    while (i < ticks) : (i += 1) {
+        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(ticks - 1));
+        const a = std.math.degreesToRadians(-sweep_deg + t * (2.0 * sweep_deg));
+        const dx = std.math.sin(a);
+        const dy = -std.math.cos(a);
+        gl.glVertex2f(cx + dx * r * 1.08, cy + dy * r * 1.08);
+        gl.glVertex2f(cx + dx * r * 1.20, cy + dy * r * 1.20);
+    }
+    gl.glEnd();
+    gl.glLineWidth(1.0);
+}
+
+/// The original vertex-shaded knob. Used only when the baked filmstrip is
+/// missing.
+fn drawKnobFallback(cx: f32, cy: f32, r: f32, value: f32) void {
     // Drop shadow.
     discFlat(cx + 1.5, cy + 2.5, r * 1.03, 0, 0, 0, 90);
 
@@ -193,25 +244,7 @@ pub fn drawKnob(cx: f32, cy: f32, r: f32, value: f32, ticks: usize) void {
     // Specular glint, upper-left.
     discFlat(cx - r * 0.3, cy - r * 0.36, r * 0.16, 255, 250, 240, 45);
 
-    // Tick ring.
-    if (ticks >= 2) {
-        gl.glLineWidth(1.5);
-        color(theme.label.r, theme.label.g, theme.label.b, 235);
-        gl.glBegin(gl.GL_LINES);
-        var i: usize = 0;
-        while (i < ticks) : (i += 1) {
-            const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(ticks - 1));
-            const a = std.math.degreesToRadians(-sweep_deg + t * (2.0 * sweep_deg));
-            const dx = std.math.sin(a);
-            const dy = -std.math.cos(a);
-            gl.glVertex2f(cx + dx * r * 1.08, cy + dy * r * 1.08);
-            gl.glVertex2f(cx + dx * r * 1.20, cy + dy * r * 1.20);
-        }
-        gl.glEnd();
-        gl.glLineWidth(1.0);
-    }
-
-    // Pointer on the cap.
+    // Pointer on the cap. (The tick ring is drawn by the caller either way.)
     const a = std.math.degreesToRadians(-sweep_deg + std.math.clamp(value, 0.0, 1.0) * (2.0 * sweep_deg));
     const dx = std.math.sin(a);
     const dy = -std.math.cos(a);

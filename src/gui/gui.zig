@@ -10,6 +10,7 @@ const renderer = @import("renderer.zig");
 const decor = @import("decor.zig");
 const panel = @import("panel.zig");
 const font = @import("font.zig");
+const texture = @import("texture.zig");
 const params = @import("../params.zig");
 const c_abi = @import("../c.zig");
 const c = clay.c;
@@ -49,6 +50,10 @@ pub const Gui = struct {
 
     clay_memory: []u8 = &.{},
     clay_ctx: ?*c.Clay_Context = null,
+
+    /// Baked panel textures. Texture names belong to the GL context, so this is
+    /// (re)loaded in `initGl` and released in `teardownWindow`.
+    textures: texture.Set = .{},
 
     width: u32 = default_width,
     height: u32 = default_height,
@@ -183,11 +188,20 @@ pub const Gui = struct {
         if (rc == null) return false;
         self.hglrc = rc;
         _ = win32.wglMakeCurrent(hdc, rc);
+        // Textures live in the context, so they must be uploaded after it is
+        // current and released before it is destroyed.
+        self.textures = texture.Set.load();
         return true;
     }
 
     fn teardownWindow(self: *Gui) void {
         if (self.hwnd) |hwnd| _ = win32.KillTimer(hwnd, timer_id);
+        // Release GL objects while their context is still current.
+        if (self.hdc != null and self.hglrc != null) {
+            _ = win32.wglMakeCurrent(self.hdc, self.hglrc);
+            self.textures.unload();
+        }
+        self.textures = .{};
         _ = win32.wglMakeCurrent(null, null);
         if (self.hglrc) |rc| _ = win32.wglDeleteContext(rc);
         if (self.hdc) |hdc| _ = win32.ReleaseDC(self.hwnd, hdc);
@@ -226,7 +240,7 @@ pub const Gui = struct {
 
         gl.glClearColor(0.06, 0.05, 0.04, 1.0);
         gl.glClear(gl.GL_COLOR_BUFFER_BIT);
-        decor.drawTolexBackground(@intCast(self.width), @intCast(self.height));
+        decor.drawTolexBackground(&self.textures, @intCast(self.width), @intCast(self.height));
         renderer.render(commands, @intCast(self.width), @intCast(self.height));
 
         // Knob overlay: draw the shaded knob into each cached box on top of the
@@ -237,7 +251,7 @@ pub const Gui = struct {
             const cx = b.x + b.width * 0.5;
             const cy = b.y + b.height * 0.5;
             const r = @min(b.width, b.height) * 0.5 - 2.0;
-            decor.drawKnob(cx, cy, r, values[i], panel.tickCount(i));
+            decor.drawKnob(&self.textures, cx, cy, r, values[i], panel.tickCount(i));
         }
 
         _ = win32.SwapBuffers(self.hdc);

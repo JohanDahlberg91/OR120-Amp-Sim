@@ -1,13 +1,19 @@
 //! Translates the Clay render-command array into legacy OpenGL draw calls.
 //!
 //! Handles solid and rounded rectangles, plain and rounded borders, scissor
-//! clipping and text (drawn with the vector stroke font). Image and custom
-//! commands are ignored — the panel styling is procedural.
+//! clipping, text (drawn with the vector stroke font) and images. Custom
+//! commands are ignored.
+//!
+//! Image elements carry their `texture.Texture` through Clay's opaque
+//! `imageData` pointer, so a layout can place baked art the same way it places
+//! a rectangle. Whoever declares the element owns the texture and must keep it
+//! alive for the frame.
 
 const std = @import("std");
 const gl = @import("gl.zig");
 const clay = @import("clay.zig");
 const font = @import("font.zig");
+const texture = @import("texture.zig");
 const c = clay.c;
 
 const arc_segments = 6;
@@ -151,8 +157,21 @@ pub fn render(commands: clay.RenderCommandArray, fb_width: i32, fb_height: i32) 
             c.CLAY_RENDER_COMMAND_TYPE_SCISSOR_END => {
                 gl.glDisable(gl.GL_SCISSOR_TEST);
             },
+            c.CLAY_RENDER_COMMAND_TYPE_IMAGE => {
+                const id = cmd.*.renderData.image;
+                // `imageData` is an opaque user pointer; we always store a
+                // *const texture.Texture there. A null means the element was
+                // declared without art, so there is simply nothing to draw.
+                const raw = id.imageData orelse continue;
+                const tex: *const texture.Texture = @ptrCast(@alignCast(raw));
+                const tint = id.backgroundColor;
+                // A zeroed backgroundColor means "no tint" rather than
+                // "transparent" — Clay leaves it zeroed unless it is set.
+                const alpha: f32 = if (tint.a == 0) 1.0 else tint.a / 255.0;
+                texture.drawQuad(tex.*, bb.x, bb.y, bb.width, bb.height, alpha);
+            },
             else => {
-                // IMAGE / CUSTOM: not drawn.
+                // CUSTOM: not drawn.
             },
         }
     }

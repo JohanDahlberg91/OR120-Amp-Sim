@@ -30,6 +30,21 @@ if (-not (Test-Path $clayHeader)) {
     Write-Host "clay.h already present."
 }
 
+# --- stb single-header image codecs ---
+# stb_image decodes the baked GUI PNGs at plugin load; stb_image_write is used
+# by tools/bake_assets to emit them. Both are public domain.
+$stbDir = Join-Path $vendor "stb"
+New-Item -ItemType Directory -Force -Path $stbDir | Out-Null
+foreach ($h in @("stb_image.h", "stb_image_write.h")) {
+    $dest = Join-Path $stbDir $h
+    if (-not (Test-Path $dest)) {
+        Write-Host "Downloading $h..."
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/nothings/stb/master/$h" -OutFile $dest
+    } else {
+        Write-Host "$h already present."
+    }
+}
+
 # --- clap-wrapper (projects our CLAP into a VST3; needed for Phase 7) ---
 # The CLAP + VST3 SDKs it depends on are fetched by clap-wrapper itself at
 # CMake-configure time (CLAP_WRAPPER_DOWNLOAD_DEPENDENCIES), so only the wrapper

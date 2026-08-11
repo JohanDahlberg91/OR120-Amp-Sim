@@ -3,7 +3,7 @@
 //! The per-channel chain follows the real OR120 signal path:
 //!
 //!   input → V1A gain stage (2x OS triode)
-//!         → Baxandall tone stack (interactive Bass / Treble)
+//!         → James tone stack (passive Baxandall, solved as the real network)
 //!         → F.A.C. stepped low-cut (coupling-cap ladder)
 //!         → HF Drive bright boost → V1B gain stage (2x OS triode)
 //!         → Cathodyne phase inverter (clean, unity — no shaping)
@@ -18,6 +18,8 @@ const std = @import("std");
 const filters = @import("filters.zig");
 const waveshaper = @import("waveshaper.zig");
 const oversample = @import("oversample.zig");
+const tonestack = @import("tonestack.zig");
+const rt_audit = @import("rt_audit.zig");
 
 const Biquad = filters.Biquad;
 const OnePole = filters.OnePole;
@@ -100,8 +102,9 @@ fn powerShape(ctx: *PowerStage, x: f32) f32 {
 /// only the internal delay/envelope state is per-channel.
 const Channel = struct {
     v1a: Oversampler2x = .{},
-    bass: Biquad = .{},
-    treble: Biquad = .{},
+    /// Capacitor state of the James tone stack. Its coefficients live on the
+    /// Engine (they depend only on the knobs, which both channels share).
+    tone: tonestack.State = .{},
     fac: OnePole = .{},
     bright: Biquad = .{},
     v1b: Oversampler2x = .{},
@@ -112,8 +115,7 @@ const Channel = struct {
 
     fn reset(self: *Channel) void {
         self.v1a.reset();
-        self.bass.reset();
-        self.treble.reset();
+        self.tone.reset();
         self.fac.reset();
         self.bright.reset();
         self.v1b.reset();
@@ -126,9 +128,11 @@ const Channel = struct {
     inline fn process(self: *Channel, eng: *const Engine, x: f32) f32 {
         // V1A first gain stage.
         var s = self.v1a.process(x, TriodeCtx{ .drive = eng.pre_drive, .bias = eng.pre_bias }, triodeShape);
-        // Baxandall active tone stack (flat mids, interactive bass/treble).
-        s = self.bass.process(s);
-        s = self.treble.process(s);
+        // James (passive Baxandall) tone stack, solved as the real network.
+        // It is lossy by nature; `midband_makeup` stands in for V1B's recovery
+        // gain in the real amp. The loss is frequency-dependent, so what reaches
+        // the next stage varies with the knobs — that is the point.
+        s = self.tone.process(&eng.tone, s) * tonestack.midband_makeup;
         // F.A.C. progressive low-cut before the second stage.
         s = self.fac.processHighpass(s);
         // HF Drive bright emphasis feeding V1B.
@@ -170,6 +174,9 @@ pub const Engine = struct {
     sag_depth: f32 = 0.33,
     sag_atk: f32 = 0.02,
     sag_rel: f32 = 0.001,
+
+    /// Tone-stack solve matrix. Shared: it depends only on the knob positions.
+    tone: tonestack.Coeffs = .{},
 
     channels: [2]Channel = .{ .{}, .{} },
 
@@ -216,9 +223,12 @@ pub const Engine = struct {
         self.sag_atk = 1.0 - std.math.exp(-1.0 / (0.005 * sr));
         self.sag_rel = 1.0 - std.math.exp(-1.0 / (0.150 * sr));
 
-        // Baxandall tone stack: complementary shelves pivoting around the mids.
-        const bass_db = (controls.bass - 5.0) / 5.0 * 14.0;
-        const treble_db = (controls.treble - 5.0) / 5.0 * 14.0;
+        // James tone stack: rebuild the network solve for the new knob
+        // positions. The boost/cut range, the corner frequencies and the
+        // insertion loss are all properties of the components, so there is
+        // nothing to scale here — the knobs map straight onto the wipers.
+        self.tone.set(controls.bass / 10.0, controls.treble / 10.0, self.sample_rate);
+
         // HF Drive brightness: a top-end lift into V1B (boost only).
         const bright_db = (controls.hf_drive / 10.0) * 10.0;
 
@@ -230,14 +240,13 @@ pub const Engine = struct {
         const fac_hz = fac_cutoffs[step];
 
         for (&self.channels) |*ch| {
-            ch.bass.setLowShelf(300.0, bass_db, sr);
-            ch.treble.setHighShelf(1600.0, treble_db, sr);
             ch.bright.setHighShelf(1500.0, bright_db, sr);
             ch.fac.setLowpass(fac_hz, sr);
         }
     }
 
-    /// Process a de-interleaved stereo block in place.
+    /// Process a de-interleaved stereo block in place. Runs on the audio thread:
+    /// no allocation, no locks, no syscalls — see `rt_audit.zig`.
     pub fn processBlock(self: *Engine, left: []f32, right: []f32) void {
         if (self.bypass) return;
         const n = @min(left.len, right.len);
@@ -248,6 +257,12 @@ pub const Engine = struct {
         }
     }
 };
+
+// The engine lives inline in the plugin struct and is the only state the audio
+// thread mutates, so it must not own heap memory. Enforced at build time.
+comptime {
+    rt_audit.assertNoHeapOwnership(Engine);
+}
 
 test "bypass leaves buffer untouched" {
     var eng = Engine.init();

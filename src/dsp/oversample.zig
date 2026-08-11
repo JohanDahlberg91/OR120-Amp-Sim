@@ -14,7 +14,7 @@ const std = @import("std");
 /// Number of FIR taps. Odd so the filter is symmetric with an integer delay.
 pub const num_taps = 31;
 
-const coeffs: [num_taps]f32 = blk: {
+pub const coeffs: [num_taps]f32 = blk: {
     @setEvalBranchQuota(200000);
     var h: [num_taps]f32 = undefined;
     const m: f64 = @floatFromInt(num_taps - 1);

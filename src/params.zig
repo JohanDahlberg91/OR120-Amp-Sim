@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const c = @import("c.zig");
+const rt_audit = @import("dsp/rt_audit.zig");
 
 pub const ParamId = enum(u32) {
     gain = 0,
@@ -115,6 +116,15 @@ pub const ChangeQueue = struct {
         return change;
     }
 };
+
+// Both of these are read/written by the audio thread during `process`, so like
+// the DSP engine they must be flat fixed-size values with no heap ownership.
+// The ring buffer in particular must keep its inline `buf`: switching it to an
+// allocated slice would put a `free`/`realloc` on the audio thread.
+comptime {
+    rt_audit.assertNoHeapOwnership(State);
+    rt_audit.assertNoHeapOwnership(ChangeQueue);
+}
 
 test "state initializes to defaults and clamps" {
     var s = State.init();
